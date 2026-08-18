@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "relationship-line-bot",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-09",
+  "kv_namespaces": [
+    {
+      "binding": "LINE_USERS",
+      "id": "21860c0dd6a3475794e506f7edd13a64"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "0 */1 * * *"
+    ]
+  }
+}
