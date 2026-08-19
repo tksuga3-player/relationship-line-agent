@@ -12,9 +12,13 @@ export {
   createDiagnosisState,
   ensureDiagnosisState,
   getDiagnosisDecision,
+  diagnosisResultFallbackMessage,
+  diagnosisResultMessage,
+  parseDiagnosisResultContent,
   parseDiagnosisExtractionResponse,
   processMessage,
   processDiagnosisMessage,
+  processFollowEvent,
   selectNextDiagnosisField,
   selectNextDiagnosisQuestion,
   shouldUseDiagnosisFlow
@@ -70,6 +74,39 @@ async function withFetch(mock, run) {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+async function createLineSignature(body, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(body)
+  );
+  return Buffer.from(signature).toString("base64");
+}
+
+async function sendWebhookEvents(events, env) {
+  const body = JSON.stringify({ events });
+  const signature = await createLineSignature(body, env.LINE_CHANNEL_SECRET);
+  const pending = [];
+  const response = await diagnosis.default.fetch(
+    new Request("https://example.test/webhook", {
+      method: "POST",
+      headers: { "x-line-signature": signature },
+      body
+    }),
+    env,
+    { waitUntil(promise) { pending.push(promise); } }
+  );
+  await Promise.all(pending);
+  return response;
 }
 
 test("現行Tally互換のPhase 0〜5を判定する", () => {
@@ -730,4 +767,451 @@ test("圧縮質問の抽出失敗後は個別Qへ戻り、2回目の失敗で固
   assert.equal(stored.diagnosis.extractionFailureCount, 2);
   assert.match(replies[0], /最初の反応はどんなことが多い/);
   assert.match(replies[1], /A: 距離を取る・早く切る/);
+});
+
+test("完全新規followは最小KVと歓迎文だけを作成し、Difyを呼ばない", async () => {
+  const kv = createKv();
+  const replies = [];
+  let difyCalls = 0;
+  const env = {
+    LINE_USERS: kv,
+    LINE_CHANNEL_SECRET: "channel-secret",
+    LINE_CHANNEL_ACCESS_TOKEN: "token",
+    DIFY_API_KEY: "test"
+  };
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      difyCalls++;
+      throw new Error("follow must not call Dify");
+    }
+    replies.push(JSON.parse(options.body).messages[0].text);
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const response = await sendWebhookEvents([{
+      type: "follow",
+      source: { userId: "new-user" },
+      replyToken: "follow-reply"
+    }], env);
+    assert.equal(response.status, 200);
+  });
+
+  const stored = kv.read("new-user");
+  assert.equal(difyCalls, 0);
+  assert.equal(stored.lineUserId, "new-user");
+  assert.ok(stored.linkedAt);
+  assert.ok(stored.updatedAt);
+  assert.equal("phase" in stored, false);
+  assert.equal("diagnosis" in stored, false);
+  assert.equal("difyConversationId" in stored, false);
+  assert.deepEqual(replies, [
+    "友だち追加ありがとうございます。\n\n" +
+      "「無料：恋愛ボトルネック診断＋あなたの次の一手」\n" +
+      "をここから始められます。\n\n" +
+      "いくつか会話するだけで、\n" +
+      "今どこで詰まっているかと、\n" +
+      "次に何を直すべきかを見ます。\n\n" +
+      "特定の相手がいるなら今どんな関係か、\n" +
+      "いないなら最近の女性とのやり取りを、\n" +
+      "そのまま話してください。"
+  ]);
+});
+
+test("follow後の最初のテキストは既存の診断v1.1へ進む", async () => {
+  const kv = createKv();
+  const env = {
+    LINE_USERS: kv,
+    LINE_CHANNEL_SECRET: "channel-secret",
+    LINE_CHANNEL_ACCESS_TOKEN: "token",
+    DIFY_API_KEY: "test"
+  };
+  let difyCalls = 0;
+  const replies = [];
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      difyCalls++;
+      return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [{
+        field: "q1", value: "B", state: "explicit", evidence: "気になる人はいるが二人では会っていない"
+      }] }) }), { status: 200 });
+    }
+    replies.push(JSON.parse(options.body).messages[0].text);
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    await sendWebhookEvents([{
+      type: "follow",
+      source: { userId: "new-user" },
+      replyToken: "follow-reply"
+    }], env);
+    await diagnosis.processMessage("気になる人はいます", "new-user", "text-reply", env);
+  });
+
+  const stored = kv.read("new-user");
+  assert.equal(difyCalls, 1);
+  assert.equal(stored.phase, undefined);
+  assert.equal(stored.diagnosis.status, "active");
+  assert.equal(stored.diagnosis.answers.q1.value, "B");
+  assert.equal(stored.diagnosis.pendingGroup, "safety_context");
+  assert.match(replies[1], /最初の反応、そのあと会話がどう続いたか/);
+});
+
+test("既存ユーザーのfollowと再送は既存状態を破壊しない", async () => {
+  const activeDiagnosis = explicit(diagnosis.createDiagnosisState(), { q1: "B" });
+  const existing = {
+    lineUserId: "existing-user",
+    linkedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z",
+    phase: "2",
+    difyConversationId: "conversation-1",
+    diagnosis: activeDiagnosis,
+    onboardingSentAt: "onboarding",
+    step1SentAt: "step1",
+    step2SentAt: "step2",
+    precisionOfferSentAt: "offer",
+    phaseProgress: { progress: "keep" },
+    diagnosisSource: "tally",
+    chatHandoffId: "handoff"
+  };
+  const kv = createKv({ "existing-user": existing });
+  const welcomeReplies = [];
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      throw new Error("follow must not call Dify");
+    }
+    welcomeReplies.push(JSON.parse(options.body).messages[0].text);
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, LINE_CHANNEL_ACCESS_TOKEN: "token", DIFY_API_KEY: "test" };
+    await diagnosis.processFollowEvent("existing-user", "follow-1", env);
+    await diagnosis.processFollowEvent("existing-user", "follow-2", env);
+  });
+
+  assert.deepEqual(kv.read("existing-user"), existing);
+  assert.equal(welcomeReplies.length, 2);
+});
+
+test("phase未確定のactive diagnosisユーザーもfollowで診断状態を保持する", async () => {
+  const activeDiagnosis = explicit(diagnosis.createDiagnosisState(), { q1: "B", q3: "C" });
+  activeDiagnosis.pendingField = "q4";
+  const existing = {
+    lineUserId: "active-user",
+    linkedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z",
+    diagnosis: activeDiagnosis,
+    difyConversationId: "must-remain"
+  };
+  const kv = createKv({ "active-user": existing });
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      throw new Error("follow must not call Dify");
+    }
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, LINE_CHANNEL_ACCESS_TOKEN: "token", DIFY_API_KEY: "test" };
+    await diagnosis.processFollowEvent("active-user", "follow", env);
+  });
+
+  assert.deepEqual(kv.read("active-user"), existing);
+  assert.equal(diagnosis.shouldUseDiagnosisFlow(kv.read("active-user")), true);
+});
+
+test("診断完了時は確定phaseをWorkerで固定し、根拠と次の一手を表示する", async () => {
+  const state = pendingGroupState({ q1: "B" }, "safety_context");
+  const kv = createKv({ user: { diagnosis: state } });
+  const replies = [];
+  let resultPrompt = "";
+  let difyCalls = 0;
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      difyCalls++;
+      const query = JSON.parse(options.body).query;
+      if (difyCalls === 1) {
+        return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [
+          { field: "q3", value: "B", state: "explicit", evidence: "返事はあるが固い" },
+          { field: "q4", value: "B", state: "explicit", evidence: "すぐ途切れる" },
+          { field: "q5", value: "C", state: "explicit", evidence: "質問は普通にある" }
+        ] }) }), { status: 200 });
+      }
+      resultPrompt = query;
+      return new Response(JSON.stringify({ answer: JSON.stringify({
+        reason: "返事はあるものの、会話が早く途切れるという回答がありました。",
+        nextStep: "まずは相手が返しやすい話題を一つ置き、反応を待つことを優先してください。"
+      }) }), { status: 200 });
+    }
+    replies.push(JSON.parse(options.body).messages[0].text);
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, DIFY_API_KEY: "test", LINE_CHANNEL_ACCESS_TOKEN: "test" };
+    await diagnosis.processDiagnosisMessage("返事は固くてすぐ終わりますが、質問は普通にあります", "user", "reply", env, kv.read("user"));
+  });
+
+  const stored = kv.read("user");
+  assert.equal(stored.phase, 2);
+  assert.equal(stored.diagnosis.status, "complete");
+  assert.match(replies[0], /【今のボトルネック】\n安全ライン/);
+  assert.match(replies[0], /【なぜそう判定したか】/);
+  assert.match(replies[0], /【あなたの次の一手】/);
+  assert.match(resultPrompt, /Workerが確定したphase:\n2 \(安全ライン\)/);
+  assert.match(resultPrompt, /返事はあるが固い/);
+});
+
+test("診断結果生成LLMの失敗時もphaseを保存し、固定フォールバックを返す", async () => {
+  const state = pendingGroupState({ q1: "B" }, "safety_context");
+  const kv = createKv({ user: { diagnosis: state } });
+  const replies = [];
+  let difyCalls = 0;
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    await withFetch(async (url, options) => {
+      if (String(url).includes("api.dify.ai")) {
+        difyCalls++;
+        if (difyCalls === 1) {
+          return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [
+            { field: "q3", value: "B", state: "explicit", evidence: "返事はあるが固い" },
+            { field: "q4", value: "B", state: "explicit", evidence: "すぐ途切れる" },
+            { field: "q5", value: "C", state: "explicit", evidence: "質問は普通にある" }
+          ] }) }), { status: 200 });
+        }
+        return new Response("unavailable", { status: 503 });
+      }
+      replies.push(JSON.parse(options.body).messages[0].text);
+      return new Response("{}", { status: 200 });
+    }, async () => {
+      const env = { LINE_USERS: kv, DIFY_API_KEY: "test", LINE_CHANNEL_ACCESS_TOKEN: "test" };
+      await diagnosis.processDiagnosisMessage("返事は固くてすぐ終わりますが、質問は普通にあります", "user", "reply", env, kv.read("user"));
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  const stored = kv.read("user");
+  assert.equal(stored.phase, 2);
+  assert.equal(stored.diagnosis.status, "complete");
+  assert.match(replies[0], /【今のボトルネック】\n安全ライン/);
+  assert.match(replies[0], /まずはこのラインを越えることを優先しましょう/);
+});
+
+test("LLMが異なるphaseを含めても、保存・表示するphaseはWorker確定値を維持する", async () => {
+  const state = pendingGroupState({ q1: "B" }, "safety_context");
+  const kv = createKv({ user: { diagnosis: state } });
+  const replies = [];
+  let difyCalls = 0;
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      difyCalls++;
+      if (difyCalls === 1) {
+        return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [
+          { field: "q3", value: "B", state: "explicit", evidence: "返事はあるが固い" },
+          { field: "q4", value: "B", state: "explicit", evidence: "すぐ途切れる" },
+          { field: "q5", value: "C", state: "explicit", evidence: "質問は普通にある" }
+        ] }) }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ answer: JSON.stringify({
+        phase: 0,
+        reason: "回答に基づく説明です。",
+        nextStep: "一つだけ取り組んでください。"
+      }) }), { status: 200 });
+    }
+    replies.push(JSON.parse(options.body).messages[0].text);
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, DIFY_API_KEY: "test", LINE_CHANNEL_ACCESS_TOKEN: "test" };
+    await diagnosis.processDiagnosisMessage("返事は固くてすぐ終わりますが、質問は普通にあります", "user", "reply", env, kv.read("user"));
+  });
+
+  assert.equal(kv.read("user").phase, 2);
+  assert.match(replies[0], /【今のボトルネック】\n安全ライン/);
+  assert.doesNotMatch(replies[0], /接触導線不足/);
+});
+
+test("scheduledハンドラは従来どおりfollow・診断Difyを呼ばず完了する", async () => {
+  let scheduledWork;
+  const env = {
+    LINE_USERS: {
+      async list() {
+        return { keys: [], list_complete: true };
+      }
+    },
+    LINE_CHANNEL_ACCESS_TOKEN: "test"
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("空のscheduled処理は外部通信しない");
+  };
+
+  try {
+    await diagnosis.default.scheduled({}, env, {
+      waitUntil(promise) {
+        scheduledWork = promise;
+      }
+    });
+    await scheduledWork;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("診断結果生成Difyは通常会話のconversation_idを使用・上書きしない", async () => {
+  const state = pendingGroupState({ q1: "B" }, "safety_context");
+  const kv = createKv({
+    user: { diagnosis: state, difyConversationId: "normal-conversation" }
+  });
+  const difyBodies = [];
+
+  await withFetch(async (url, options) => {
+    if (String(url).includes("api.dify.ai")) {
+      const body = JSON.parse(options.body);
+      difyBodies.push(body);
+      if (difyBodies.length === 1) {
+        return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [
+          { field: "q3", value: "B", state: "explicit", evidence: "返事はあるが固い" },
+          { field: "q4", value: "B", state: "explicit", evidence: "すぐ途切れる" },
+          { field: "q5", value: "C", state: "explicit", evidence: "質問は普通にある" }
+        ] }) }), { status: 200 });
+      }
+      if (difyBodies.length === 2) {
+        return new Response(JSON.stringify({
+          answer: JSON.stringify({ reason: "根拠です。", nextStep: "次の一手です。" }),
+          conversation_id: "result-only-conversation"
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        answer: "通常伴走AIの返答",
+        conversation_id: "normal-conversation"
+      }), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, DIFY_API_KEY: "test", LINE_CHANNEL_ACCESS_TOKEN: "test" };
+    await diagnosis.processDiagnosisMessage("診断回答", "user", "reply-1", env, kv.read("user"));
+    assert.equal(kv.read("user").difyConversationId, "normal-conversation");
+    await diagnosis.processMessage("次の相談です", "user", "reply-2", env);
+  });
+
+  assert.equal("conversation_id" in difyBodies[0], false);
+  assert.equal("conversation_id" in difyBodies[1], false);
+  assert.equal(difyBodies[2].conversation_id, "normal-conversation");
+  assert.doesNotMatch(difyBodies[2].query, /文章作成者|explicit answers/);
+  assert.equal(kv.read("user").difyConversationId, "normal-conversation");
+});
+
+test("結果生成の空・壊れたJSONは拒否し、長文でも次の一手をLINE上限内に残す", () => {
+  assert.equal(diagnosis.parseDiagnosisResultContent(""), null);
+  assert.equal(diagnosis.parseDiagnosisResultContent("not-json"), null);
+  assert.equal(diagnosis.parseDiagnosisResultContent('{"reason":'), null);
+
+  const fenced = diagnosis.parseDiagnosisResultContent(
+    '説明です\n```json\n{"reason":"根拠","nextStep":"一手"}\n```'
+  );
+  assert.deepEqual(fenced, { reason: "根拠", nextStep: "一手" });
+
+  const longContent = diagnosis.parseDiagnosisResultContent(JSON.stringify({
+    reason: "理".repeat(6000),
+    nextStep: "手".repeat(6000)
+  }));
+  assert.equal(longContent.reason.length, 1200);
+  assert.equal(longContent.nextStep.length, 1200);
+  const message = diagnosis.diagnosisResultMessage(2, longContent);
+  assert.ok(message.length < 5000);
+  assert.match(message, /【あなたの次の一手】/);
+  assert.ok(message.indexOf("【あなたの次の一手】") < message.length - 1200);
+});
+
+test("Phase 5はボトルネックと表示せず、専用の完了表現を使う", () => {
+  const generated = diagnosis.diagnosisResultMessage(5, {
+    reason: "4つの判定ラインを通過した回答でした。",
+    nextStep: "現在の関係を安定させるテーマを整理してください。"
+  });
+  const fallback = diagnosis.diagnosisResultFallbackMessage(5);
+
+  for (const message of [generated, fallback]) {
+    assert.match(message, /【診断結果】\n長期伴侶ラインを通過/);
+    assert.doesNotMatch(message, /今のボトルネック/);
+  }
+});
+
+test("診断結果のLINE Replyが失敗してもPhaseは保持される", async () => {
+  const state = pendingGroupState({ q1: "B" }, "safety_context");
+  const kv = createKv({ user: { diagnosis: state } });
+  let difyCalls = 0;
+  let fallbackPush = "";
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    await withFetch(async (url, options) => {
+      if (String(url).includes("api.dify.ai")) {
+        difyCalls++;
+        if (difyCalls === 1) {
+          return new Response(JSON.stringify({ answer: JSON.stringify({ extractions: [
+            { field: "q3", value: "B", state: "explicit", evidence: "返事はあるが固い" },
+            { field: "q4", value: "B", state: "explicit", evidence: "すぐ途切れる" },
+            { field: "q5", value: "C", state: "explicit", evidence: "質問は普通にある" }
+          ] }) }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ answer: JSON.stringify({
+          reason: "根拠です。", nextStep: "次の一手です。"
+        }) }), { status: 200 });
+      }
+      if (String(url).includes("/message/reply")) {
+        return new Response("expired", { status: 400 });
+      }
+      fallbackPush = JSON.parse(options.body).messages[0].text;
+      return new Response("{}", { status: 200 });
+    }, async () => {
+      const env = { LINE_USERS: kv, DIFY_API_KEY: "test", LINE_CHANNEL_ACCESS_TOKEN: "test" };
+      await diagnosis.processMessage("診断回答", "user", "reply", env);
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  const stored = kv.read("user");
+  assert.equal(stored.phase, 2);
+  assert.equal(stored.diagnosis.status, "complete");
+  assert.match(fallbackPush, /【今のボトルネック】\n安全ライン/);
+  assert.match(fallbackPush, /【あなたの次の一手】/);
+});
+
+test("followでupdatedAtを更新してもscheduledはonboardingSentAtを基準にする", async () => {
+  const onboardingSentAt = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  const kv = createKv({
+    user: { phase: 2, onboardingSentAt, marker: "keep" }
+  });
+  kv.list = async () => ({ keys: [{ name: "user" }], list_complete: true });
+  const pushed = [];
+  let scheduledWork;
+
+  await withFetch(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (String(url).includes("/message/push")) {
+      pushed.push(body.messages[0].text);
+    }
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    const env = { LINE_USERS: kv, LINE_CHANNEL_ACCESS_TOKEN: "test" };
+    await diagnosis.processFollowEvent("user", "follow-reply", env);
+    const afterFollow = kv.read("user");
+    assert.ok(afterFollow.linkedAt);
+    assert.ok(afterFollow.updatedAt);
+    assert.equal(afterFollow.onboardingSentAt, onboardingSentAt);
+    assert.equal(afterFollow.marker, "keep");
+
+    await diagnosis.default.scheduled({}, env, {
+      waitUntil(promise) {
+        scheduledWork = promise;
+      }
+    });
+    await scheduledWork;
+  });
+
+  const stored = kv.read("user");
+  assert.ok(stored.step1SentAt);
+  assert.equal(pushed.length, 1);
 });

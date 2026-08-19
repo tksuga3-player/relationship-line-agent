@@ -2,6 +2,26 @@ const encoder = new TextEncoder();
 
 const DIAGNOSIS_VERSION = "tally-v3.1-line-v1";
 
+const FOLLOW_WELCOME_MESSAGE =
+  "友だち追加ありがとうございます。\n\n" +
+  "「無料：恋愛ボトルネック診断＋あなたの次の一手」\n" +
+  "をここから始められます。\n\n" +
+  "いくつか会話するだけで、\n" +
+  "今どこで詰まっているかと、\n" +
+  "次に何を直すべきかを見ます。\n\n" +
+  "特定の相手がいるなら今どんな関係か、\n" +
+  "いないなら最近の女性とのやり取りを、\n" +
+  "そのまま話してください。";
+
+const DIAGNOSIS_PHASE_LABELS = {
+  0: "接触導線不足",
+  1: "拒絶ライン",
+  2: "安全ライン",
+  3: "男としての候補ライン",
+  4: "長期伴侶ライン",
+  5: "長期伴侶ラインを通過"
+};
+
 const DIAGNOSIS_Q_CATALOG = {
   q1: ["A", "B", "C", "D", "E", "F"],
   q2: ["A", "B", "C", "D", "E"],
@@ -230,6 +250,20 @@ if (request.method === "POST" && url.pathname === "/onboarding") {
       }
 
       for (const event of data.events) {
+        if (event.type === "follow") {
+          const userId = event.source?.userId;
+          if (!userId) continue;
+
+          ctx.waitUntil(
+            processFollowEvent(
+              userId,
+              event.replyToken,
+              env
+            )
+          );
+          continue;
+        }
+
         if (
           event.type === "message" &&
           event.message?.type === "text"
@@ -264,6 +298,69 @@ if (request.method === "POST" && url.pathname === "/onboarding") {
     ctx.waitUntil(runFollowupPreview(env));
   }
 };
+
+async function processFollowEvent(userId, replyToken, env) {
+  let existingUser = null;
+  let hasExistingRecord = false;
+
+  try {
+    const saved = await env.LINE_USERS.get(userId);
+    if (saved) {
+      hasExistingRecord = true;
+      existingUser = JSON.parse(saved);
+    }
+  } catch (error) {
+    // 既存データを読めない場合は、破壊を避けて上書きしない。
+    console.error("Follow user lookup failed:", error);
+    return;
+  }
+
+  const now = new Date().toISOString();
+  if (!hasExistingRecord) {
+    existingUser = {
+      lineUserId: userId,
+      linkedAt: now,
+      updatedAt: now
+    };
+    await env.LINE_USERS.put(userId, JSON.stringify(existingUser));
+  } else if (
+    existingUser &&
+    typeof existingUser === "object" &&
+    !Array.isArray(existingUser) &&
+    !existingUser.linkedAt
+  ) {
+    // 再追加時は既存フィールドをそのまま保ち、欠けている導線情報だけ補う。
+    existingUser.linkedAt = now;
+    existingUser.updatedAt = now;
+    await env.LINE_USERS.put(userId, JSON.stringify(existingUser));
+  } else if (!existingUser || typeof existingUser !== "object") {
+    // 想定外の既存値は、破壊を避けて保存し直さない。
+    console.error("Follow user record has an unexpected shape.");
+  }
+
+  try {
+    if (replyToken) {
+      await replyMessage(
+        replyToken,
+        FOLLOW_WELCOME_MESSAGE,
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      return;
+    }
+  } catch (replyError) {
+    console.error("Follow reply failed, falling back to push:", replyError);
+  }
+
+  try {
+    await pushMessage(
+      userId,
+      FOLLOW_WELCOME_MESSAGE,
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+  } catch (pushError) {
+    console.error("Follow welcome push failed:", pushError);
+  }
+}
 
 function createDiagnosisAnswer() {
   return {
@@ -893,18 +990,116 @@ async function extractDiagnosisCandidates(userText, userId, apiKey, diagnosis) {
   }
 }
 
-function diagnosisPhaseMessage(phase) {
-  const phaseNames = {
-    0: "接触導線不足",
-    1: "拒絶ライン",
-    2: "安全ライン",
-    3: "候補ライン",
-    4: "長期伴侶ライン",
-    5: "4つの判定ラインを通過"
-  };
+function diagnosisResultFallbackMessage(phase) {
+  const phaseLabel = DIAGNOSIS_PHASE_LABELS[phase] || `フェーズ${phase}`;
 
-  return "診断に必要な情報がそろいました。\n" +
-    `現在の判定は「${phaseNames[phase] || `フェーズ${phase}`}」です。`;
+  if (phase === 5) {
+    return "診断できました。\n\n" +
+      "【診断結果】\n" +
+      `${phaseLabel}\n\n` +
+      "【あなたの次の一手】\n" +
+      "今の関係で、長く安定して続けるために必要なことを一つずつ整理しましょう。\n\n" +
+      "この相手について、そのまま続けて相談できます。";
+  }
+
+  return "診断できました。\n\n" +
+    "【今のボトルネック】\n" +
+    `${phaseLabel}\n\n` +
+    "【あなたの次の一手】\n" +
+    "まずはこのラインを越えることを優先しましょう。\n\n" +
+    "この相手について、そのまま続けて相談できます。";
+}
+
+function getDiagnosisResultFacts(diagnosis) {
+  return Object.entries(diagnosis.answers)
+    .filter(([, answer]) => answer.state === "explicit")
+    .map(([field, answer]) => ({
+      field,
+      question: getDiagnosisCatalogEntry(field),
+      value: answer.value,
+      evidence: answer.evidence
+    }));
+}
+
+function parseDiagnosisResultContent(answer) {
+  const text = String(answer || "").trim();
+  const candidates = [text];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced) candidates.push(fenced[1]);
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const reason = typeof parsed?.reason === "string"
+        ? parsed.reason.trim().slice(0, 1200)
+        : "";
+      const nextStep = typeof parsed?.nextStep === "string"
+        ? parsed.nextStep.trim().slice(0, 1200)
+        : "";
+
+      if (reason && nextStep) return { reason, nextStep };
+    } catch {
+      // JSON以外の応答は固定フォールバックを使う。
+    }
+  }
+
+  return null;
+}
+
+function diagnosisResultMessage(phase, content) {
+  const phaseLabel = DIAGNOSIS_PHASE_LABELS[phase] || `フェーズ${phase}`;
+
+  if (phase === 5) {
+    return "診断できました。\n\n" +
+      "【診断結果】\n" +
+      `${phaseLabel}\n\n` +
+      "【なぜそう判定したか】\n" +
+      `${content.reason}\n\n` +
+      "【あなたの次の一手】\n" +
+      `${content.nextStep}\n\n` +
+      "この相手について、そのまま続けて相談できます。";
+  }
+
+  return "診断できました。\n\n" +
+    "【今のボトルネック】\n" +
+    `${phaseLabel}\n\n` +
+    "【なぜそう判定したか】\n" +
+    `${content.reason}\n\n` +
+    "【あなたの次の一手】\n" +
+    `${content.nextStep}\n\n` +
+    "この相手について、そのまま続けて相談できます。";
+}
+
+async function generateDiagnosisResultMessage(phase, diagnosis, userId, apiKey) {
+  const phaseLabel = DIAGNOSIS_PHASE_LABELS[phase] || `フェーズ${phase}`;
+  const facts = getDiagnosisResultFacts(diagnosis);
+  const phaseFiveInstruction = phase === 5
+    ? "Phase 5は未通過ラインではありません。ボトルネックという語は使わず、診断結果として自然に表現してください。"
+    : "このphaseは現在地ではなく、次に越えるべき未通過ラインです。";
+  const prompt =
+    "あなたはLINE上の恋愛診断結果を説明する文章作成者です。" +
+    "Phaseの再判定・変更・推測は禁止です。Workerが確定したphaseを絶対の前提にして、説明と次の一手だけを書いてください。" +
+    "回答にない事実を作らず、人格評価や過度な断定をせず、根拠は与えられたexplicit answers/evidenceだけに限定してください。" +
+    "次の一手は長い改善リストではなく、本人の回答を踏まえた最優先の1つだけにしてください。" +
+    "出力はJSONオブジェクトのみです。形式: {\"reason\":\"根拠を1〜3文\",\"nextStep\":\"最優先の次の一手を1つ\"}。" +
+    "phase名・Q番号・判定ロジックの説明は出さないでください。" +
+    "\n\nWorkerが確定したphase:\n" +
+    `${phase} (${phaseLabel})` +
+    "\n\nphaseの意味:\n" +
+    phaseFiveInstruction +
+    "\n\n使用できる明示回答と根拠:\n" +
+    JSON.stringify(facts);
+
+  try {
+    const result = await callDify(prompt, userId, apiKey, "");
+    const content = parseDiagnosisResultContent(result.answer);
+    return content
+      ? diagnosisResultMessage(phase, content)
+      : diagnosisResultFallbackMessage(phase);
+  } catch (error) {
+    console.error("Diagnosis result generation failed:", error);
+    return diagnosisResultFallbackMessage(phase);
+  }
 }
 
 async function processDiagnosisMessage(userText, userId, replyToken, env, userData) {
@@ -1006,7 +1201,6 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
     diagnosis.lastQuestionText = "";
     diagnosis.extractionFailureCount = 0;
     latestUserData.phase = decision.phase;
-    replyText = diagnosisPhaseMessage(decision.phase);
   } else {
     const selection = selectNextDiagnosisQuestion(diagnosis);
     const { field, group } = selection;
@@ -1056,7 +1250,25 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
   latestUserData.updatedAt = diagnosis.updatedAt;
 
   await env.LINE_USERS.put(userId, JSON.stringify(latestUserData));
-  await replyMessage(replyToken, replyText, env.LINE_CHANNEL_ACCESS_TOKEN);
+  if (decision) {
+    // Phase確定は結果文生成より先に永続化し、LLM失敗で巻き戻さない。
+    replyText = await generateDiagnosisResultMessage(
+      decision.phase,
+      diagnosis,
+      userId,
+      env.DIFY_API_KEY
+    );
+  }
+  try {
+    await replyMessage(replyToken, replyText, env.LINE_CHANNEL_ACCESS_TOKEN);
+  } catch (replyError) {
+    console.error("Diagnosis reply failed, falling back to push:", replyError);
+    await pushMessage(
+      userId,
+      replyText,
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+  }
 }
 
 function getExistingPhase(phase) {
