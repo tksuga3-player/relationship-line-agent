@@ -77,6 +77,31 @@ const DIAGNOSIS_FIELD_PROMPTS = {
   q12: "現在または直近3年で、安定して続いた最長の交際期間はどのくらいですか？"
 };
 
+// 圧縮質問は、対象Qがすべてunknownの最初の一度だけ使う。
+// 回答で一部でも埋まった場合は、以後は既存のQ単位質問へ戻す。
+const QUESTION_GROUPS = {
+  safety_context: {
+    fields: ["q3", "q4", "q5"],
+    question:
+      "最近、恋愛対象になりそうな女性と話した場面を一つ思い出してみてください。最初の反応、そのあと会話がどう続いたか、相手から質問や話題が返ってきたかを覚えている範囲で教えてください。"
+  },
+  invitation_context: {
+    fields: ["q6", "q7"],
+    question:
+      "ここ3か月くらいで、女性を二人で食事やカフェに誘った場面があれば、そのとき相手がどう返して、その後どうなったか教えてください。なければ、誘っていないことだけで大丈夫です。"
+  },
+  post_date_romantic_context: {
+    fields: ["q8", "q9"],
+    question:
+      "二人で会えたことがあるなら、その後また会う流れになったか、相手から異性としての好意を感じる反応があったかを、そのまま教えてください。"
+  },
+  long_term_stability: {
+    fields: ["q11", "q12"],
+    question:
+      "ここ3年くらいの恋愛を振り返ると、関係はどの段階で止まりやすく、いちばん安定して続いた交際はどれくらいでしたか？"
+  }
+};
+
 const DIAGNOSIS_ANSWER_STATES = new Set([
   "explicit",
   "inferred",
@@ -261,8 +286,11 @@ function createDiagnosisState(now = new Date().toISOString()) {
     answers,
     q7Applicability: "unknown",
     askedIntents: [],
+    askedGroups: [],
     pendingIntent: null,
     pendingField: null,
+    pendingGroup: null,
+    pendingFields: [],
     pendingFieldFailureCount: 0,
     pausedField: null,
     lastQuestionText: "",
@@ -287,6 +315,9 @@ function ensureDiagnosisState(existing, now = new Date().toISOString()) {
     : {};
   diagnosis.askedIntents = Array.isArray(diagnosis.askedIntents)
     ? diagnosis.askedIntents
+    : [];
+  diagnosis.askedGroups = Array.isArray(diagnosis.askedGroups)
+    ? diagnosis.askedGroups.filter((group) => Object.hasOwn(QUESTION_GROUPS, group))
     : [];
 
   for (const field of Object.keys(DIAGNOSIS_Q_CATALOG)) {
@@ -323,12 +354,21 @@ function ensureDiagnosisState(existing, now = new Date().toISOString()) {
   )
     ? diagnosis.q7Applicability
     : "unknown";
-  diagnosis.pendingIntent = Object.hasOwn(DIAGNOSIS_INTENTS, diagnosis.pendingIntent)
+  diagnosis.pendingIntent = (
+    Object.hasOwn(DIAGNOSIS_INTENTS, diagnosis.pendingIntent) ||
+    Object.hasOwn(QUESTION_GROUPS, diagnosis.pendingIntent)
+  )
     ? diagnosis.pendingIntent
     : null;
   diagnosis.pendingField = Object.hasOwn(DIAGNOSIS_Q_CATALOG, diagnosis.pendingField)
     ? diagnosis.pendingField
     : null;
+  diagnosis.pendingGroup = Object.hasOwn(QUESTION_GROUPS, diagnosis.pendingGroup)
+    ? diagnosis.pendingGroup
+    : null;
+  diagnosis.pendingFields = Array.isArray(diagnosis.pendingFields)
+    ? diagnosis.pendingFields.filter((field) => Object.hasOwn(DIAGNOSIS_Q_CATALOG, field))
+    : [];
   diagnosis.pendingFieldFailureCount = Number.isInteger(
     diagnosis.pendingFieldFailureCount
   ) && diagnosis.pendingFieldFailureCount >= 0
@@ -696,6 +736,33 @@ function selectNextDiagnosisIntent(diagnosis) {
   return field ? DIAGNOSIS_FIELD_INTENTS[field] : null;
 }
 
+function questionGroupForField(diagnosis, field) {
+  if (!field) return null;
+
+  for (const [groupName, group] of Object.entries(QUESTION_GROUPS)) {
+    if (
+      group.fields[0] === field &&
+      !diagnosis.askedGroups.includes(groupName) &&
+      group.fields.every(
+        (groupField) => diagnosis.answers[groupField]?.state === "unknown"
+      )
+    ) {
+      return groupName;
+    }
+  }
+
+  return null;
+}
+
+function selectNextDiagnosisQuestion(diagnosis) {
+  const field = selectNextDiagnosisField(diagnosis);
+  const group = questionGroupForField(diagnosis, field);
+
+  return group
+    ? { field: null, group }
+    : { field, group: null };
+}
+
 function diagnosisQuestionForField(diagnosis, field) {
   if (!field || !Object.hasOwn(DIAGNOSIS_Q_CATALOG, field)) {
     return DIAGNOSIS_FIELD_PROMPTS.q1;
@@ -704,6 +771,14 @@ function diagnosisQuestionForField(diagnosis, field) {
   return diagnosis.extractionFailureCount >= 2
     ? DIAGNOSIS_FIELD_QUESTIONS[field]
     : DIAGNOSIS_FIELD_PROMPTS[field];
+}
+
+function diagnosisQuestionForSelection(diagnosis, selection) {
+  if (selection.group) {
+    return QUESTION_GROUPS[selection.group].question;
+  }
+
+  return diagnosisQuestionForField(diagnosis, selection.field);
 }
 
 function getDiagnosisCatalogEntry(field) {
@@ -782,6 +857,10 @@ async function extractDiagnosisCandidates(userText, userId, apiKey, diagnosis) {
     "以下の正式Qカタログだけを基準に、ユーザー発話からQ1〜Q12の候補へ変換してください。" +
     "明示的に該当すると判断できるものだけをstate=explicitにしてください。" +
     "曖昧な内容を無理にA〜Fへ割り当てず、その場合はextractionsに含めないかstate=inferredにしてください。" +
+    "1回答に複数Qそれぞれの明示的根拠がある場合は、複数のextractionsを返して構いません。" +
+    "圧縮質問に含まれているだけではexplicitにせず、各Qごとに独立した根拠が必要です。推測・補完は禁止です。" +
+    "0件のextractionsでも構いません。各explicitには短いevidenceを必ず付けてください。" +
+    "Q6=Aをexplicitにする場合、Q7は出力しないでください。" +
     "出力はJSONオブジェクトのみです。形式: " +
     '{"extractions":[{"field":"q1","value":"B","state":"explicit","evidence":"根拠"}]}' +
     "。推測はstate=inferred、分からない場合はextractionsに含めません。" +
@@ -793,6 +872,13 @@ async function extractDiagnosisCandidates(userText, userId, apiKey, diagnosis) {
     (diagnosis.pendingField
       ? `${diagnosis.pendingField}\n正式設問: ${getDiagnosisCatalogEntry(diagnosis.pendingField)}\n有効選択肢: ${DIAGNOSIS_Q_CATALOG[diagnosis.pendingField].join(", ")}`
       : "未指定") +
+    "\n\n圧縮質問グループ:\n" +
+    (diagnosis.pendingGroup
+      ? JSON.stringify({
+        questionGroup: diagnosis.pendingGroup,
+        targetFields: QUESTION_GROUPS[diagnosis.pendingGroup].fields
+      })
+      : "なし") +
     "\n\n直前にBotが送った質問文:\n" +
     (diagnosis.lastQuestionText || "なし") +
     "\n\n今回のユーザー発話:\n" +
@@ -886,11 +972,20 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
   }
 
   const pendingFieldBeforeExtraction = diagnosis.pendingField;
+  const pendingGroupBeforeExtraction = diagnosis.pendingGroup;
+  const pendingFieldsBeforeExtraction = pendingGroupBeforeExtraction
+    ? QUESTION_GROUPS[pendingGroupBeforeExtraction].fields
+    : pendingFieldBeforeExtraction
+      ? [pendingFieldBeforeExtraction]
+      : [];
   const extractionResult = applyDiagnosisExtractions(diagnosis, extractions);
   const decision = getDiagnosisDecision(diagnosis);
-  const pendingFieldAdvanced = pendingFieldBeforeExtraction
-    ? extractionResult.appliedExplicitFields.includes(pendingFieldBeforeExtraction) ||
-      extractionResult.newlyNotApplicableFields.includes(pendingFieldBeforeExtraction)
+  const pendingFieldAdvanced = pendingFieldsBeforeExtraction.length > 0
+    ? pendingFieldsBeforeExtraction.some(
+      (field) =>
+        extractionResult.appliedExplicitFields.includes(field) ||
+        extractionResult.newlyNotApplicableFields.includes(field)
+    )
     : extractionResult.appliedExplicitFields.length > 0 ||
       extractionResult.newlyNotApplicableFields.length > 0;
   const diagnosisAdvanced = pendingFieldAdvanced || Boolean(decision);
@@ -904,6 +999,8 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
     diagnosis.candidateScore = decision.scores.candidateScore;
     diagnosis.pendingIntent = null;
     diagnosis.pendingField = null;
+    diagnosis.pendingGroup = null;
+    diagnosis.pendingFields = [];
     diagnosis.pendingFieldFailureCount = 0;
     diagnosis.pausedField = null;
     diagnosis.lastQuestionText = "";
@@ -911,8 +1008,9 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
     latestUserData.phase = decision.phase;
     replyText = diagnosisPhaseMessage(decision.phase);
   } else {
-    const field = selectNextDiagnosisField(diagnosis);
-    const intent = field ? DIAGNOSIS_FIELD_INTENTS[field] : null;
+    const selection = selectNextDiagnosisQuestion(diagnosis);
+    const { field, group } = selection;
+    const intent = group || (field ? DIAGNOSIS_FIELD_INTENTS[field] : null);
     const samePendingField = field && field === pendingFieldBeforeExtraction;
 
     if (diagnosisAdvanced) {
@@ -930,6 +1028,15 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
 
     diagnosis.pendingIntent = intent;
     diagnosis.pendingField = field;
+    diagnosis.pendingGroup = group;
+    diagnosis.pendingFields = group
+      ? [...QUESTION_GROUPS[group].fields]
+      : field
+        ? [field]
+        : [];
+    if (group && !diagnosis.askedGroups.includes(group)) {
+      diagnosis.askedGroups.push(group);
+    }
     if (intent && !diagnosis.askedIntents.includes(intent)) {
       diagnosis.askedIntents.push(intent);
     }
@@ -939,7 +1046,7 @@ async function processDiagnosisMessage(userText, userId, replyToken, env, userDa
       replyText = diagnosisPauseMessage(field);
     } else {
       diagnosis.pausedField = null;
-      replyText = diagnosisQuestionForField(diagnosis, field);
+      replyText = diagnosisQuestionForSelection(diagnosis, selection);
       diagnosis.lastQuestionText = replyText;
     }
   }
